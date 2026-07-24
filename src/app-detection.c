@@ -4,14 +4,16 @@
  * Application detection and file directory resolution via JNI reflection.
  *
  * This module handles the complex task of finding the correct Android
- * Application context in multi-process container environments, with
- * timing-aware polling to handle race conditions between proxy and
- * target applications.
+ * Application context in multi-process container environments. It
+ * employs multiple resolution paths and strictly accepts only applications
+ * containing the expected payload marker, preventing premature acceptance
+ * of proxy container applications.
  */
 
 #include <jni.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <linux/limits.h>
 
 #include "frida-bridge.h"
@@ -19,6 +21,137 @@
 #include "jni-helpers.h"
 
 extern int is_target_app_ready(const char *files_dir);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Application Resolution — Multiple Framework Entry Points
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * resolve_application_jni - Resolve a live Application jobject using
+ * multiple framework entry points.
+ *
+ * This function attempts to obtain the current Application object via
+ * several reflection paths, improving reliability during early process
+ * startup and in container environments where one path may be unavailable
+ * while others work.
+ *
+ * Resolution order:
+ *   1. ActivityThread.currentApplication()
+ *      Primary entry point, returns the static singleton if available.
+ *   2. ActivityThread.currentActivityThread().getApplication()
+ *      Obtains the ActivityThread instance first, then calls instance
+ *      method, may succeed when the static method returns null.
+ *   3. AppGlobals.getInitialApplication()
+ *      Last‑resort fallback; returns the initial application object.
+ *
+ * All JNI references are handled locally; on success returns a local
+ * reference that the caller must delete.
+ *
+ * @env:     JNI environment pointer.
+ * @cls_at:  Pre‑resolved ActivityThread class reference.
+ * @return:  Local reference to Application, or NULL if all paths fail.
+ */
+static jobject resolve_application_jni(JNIEnv *env, jclass cls_at) {
+  if (!env || !cls_at) return NULL;
+
+  LOGD("resolve_application_jni: attempting multiple resolution paths");
+
+  /* ───────────────────────────────────────────────────────────────────────── */
+  /* PATH 1: ActivityThread.currentApplication() (Primary) */
+  /* ───────────────────────────────────────────────────────────────────────── */
+  {
+    jmethodID mid_ca = (*env)->GetStaticMethodID(
+        env, cls_at, "currentApplication", "()Landroid/app/Application;");
+    if (mid_ca) {
+      jobject app = (*env)->CallStaticObjectMethod(env, cls_at, mid_ca);
+      JNI_CLEAR_EXCEPTION(env);
+      if (app) {
+        LOGD("resolve_application_jni: PATH 1 SUCCESS - currentApplication() returned object");
+        return app;
+      } else {
+        LOGD("resolve_application_jni: PATH 1 returned NULL");
+      }
+    } else {
+      JNI_CLEAR_EXCEPTION(env);
+      LOGD("resolve_application_jni: PATH 1 method not found");
+    }
+  }
+
+  /* ───────────────────────────────────────────────────────────────────────── */
+  /* PATH 2: ActivityThread.currentActivityThread().getApplication() */
+  /* ───────────────────────────────────────────────────────────────────────── */
+  {
+    jmethodID mid_cat = (*env)->GetStaticMethodID(
+        env, cls_at, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (mid_cat) {
+      jobject at = (*env)->CallStaticObjectMethod(env, cls_at, mid_cat);
+      JNI_CLEAR_EXCEPTION(env);
+      if (at) {
+        LOGD("resolve_application_jni: PATH 2 got ActivityThread instance");
+        
+        /* Now call getApplication() on the instance */
+        jmethodID mid_get_app = (*env)->GetMethodID(
+            env, cls_at, "getApplication", "()Landroid/app/Application;");
+        if (mid_get_app) {
+          jobject app = (*env)->CallObjectMethod(env, at, mid_get_app);
+          JNI_CLEAR_EXCEPTION(env);
+          (*env)->DeleteLocalRef(env, at);
+          
+          if (app) {
+            LOGD("resolve_application_jni: PATH 2 SUCCESS - "
+                 "currentActivityThread().getApplication() returned object");
+            return app;
+          } else {
+            LOGD("resolve_application_jni: PATH 2 getApplication() returned NULL");
+          }
+        } else {
+          JNI_CLEAR_EXCEPTION(env);
+          LOGD("resolve_application_jni: PATH 2 getApplication() method not found");
+          (*env)->DeleteLocalRef(env, at);
+        }
+      } else {
+        LOGD("resolve_application_jni: PATH 2 currentActivityThread() returned NULL");
+      }
+    } else {
+      JNI_CLEAR_EXCEPTION(env);
+      LOGD("resolve_application_jni: PATH 2 currentActivityThread() method not found");
+    }
+  }
+
+  /* ───────────────────────────────────────────────────────────────────────── */
+  /* PATH 3: AppGlobals.getInitialApplication() (Last Resort) */
+  /* ───────────────────────────────────────────────────────────────────────── */
+  {
+    jclass cls_ag = (*env)->FindClass(env, "android/app/AppGlobals");
+    if (cls_ag) {
+      jmethodID mid_gia = (*env)->GetStaticMethodID(
+          env, cls_ag, "getInitialApplication", "()Landroid/app/Application;");
+      if (mid_gia) {
+        jobject app = (*env)->CallStaticObjectMethod(env, cls_ag, mid_gia);
+        JNI_CLEAR_EXCEPTION(env);
+        (*env)->DeleteLocalRef(env, cls_ag);
+        
+        if (app) {
+          LOGD("resolve_application_jni: PATH 3 SUCCESS - "
+               "AppGlobals.getInitialApplication() returned object");
+          return app;
+        } else {
+          LOGD("resolve_application_jni: PATH 3 getInitialApplication() returned NULL");
+        }
+      } else {
+        JNI_CLEAR_EXCEPTION(env);
+        LOGD("resolve_application_jni: PATH 3 method not found");
+        (*env)->DeleteLocalRef(env, cls_ag);
+      }
+    } else {
+      JNI_CLEAR_EXCEPTION(env);
+      LOGD("resolve_application_jni: PATH 3 AppGlobals class not found");
+    }
+  }
+
+  LOGW("resolve_application_jni: all resolution paths exhausted, returning NULL");
+  return NULL;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * JNI File Directory Extraction
@@ -121,32 +254,21 @@ static int extract_files_dir_from_app(JNIEnv *env, jobject app,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Application Polling with Timing-Aware Logic
+ * Application Polling with Payload Verification
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
  * get_files_dir_jni - Obtain the target application's files directory.
  *
- * Polls ActivityThread.currentApplication() for up to 30 seconds, looking
- * for an Application that contains the expected payload marker
- * (GADGET_SUBDIR presence).
+ * Polls for an Application object containing the expected payload marker
+ * for up to 30 seconds. Uses resolve_application_jni() for robust
+ * resolution across multiple framework entry points.
  *
- * TIMING-AWARE BEHAVIOR:
- * In container environments, currentApplication() may return a proxy/container
- * Application before the real target Application is loaded. This function
- * implements intelligent early-exit logic:
- *
- *   - Payload check happens BEFORE accepting any Application.
- *   - If the same non-payload Application appears twice, it assumes no
- *     progress is being made and exits early instead of waiting the full
- *     30 seconds.
- *   - This prevents the bridge from blocking indefinitely on a proxy app
- *     when the real target hasn't loaded yet.
- *
- * JNI Reference Management:
- *   - g_last_app_seen is a function-local variable using a global JNI ref
- *     internally. Properly deleted with DeleteGlobalRef at cleanup.
- *   - All local refs (app, cls_at) are deleted in error/cleanup paths.
+ * POLLING BEHAVIOR:
+ * In container environments, a proxy application may appear before the
+ * real target. To prevent premature acceptance, this function strictly
+ * requires the payload marker to be present; it never returns a path
+ * without it. The poll continues for the full timeout if necessary.
  *
  * @out_buf:  Output buffer for the files directory path.
  * @out_sz:   Size of @out_buf.
@@ -180,22 +302,18 @@ int get_files_dir_jni(char *out_buf, size_t out_sz) {
   }
 
   jclass cls_at = NULL;
-  jmethodID mid_ca = NULL;
   jobject app = NULL;
-  jobject g_last_app_seen = NULL;
+  bool resolved_any_app = false;
+
+  #define JNI_CLR() \
+  do { \
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); \
+  } while (0)
 
   /* Find ActivityThread class. */
   cls_at = (*env)->FindClass(env, "android/app/ActivityThread");
   if (!cls_at) {
-    JNI_CLEAR_EXCEPTION(env);
-    goto jni_done;
-  }
-
-  /* Get currentApplication() static method ID. */
-  mid_ca = (*env)->GetStaticMethodID(env, cls_at, "currentApplication", 
-                                      "()Landroid/app/Application;");
-  if (!mid_ca) {
-    JNI_CLEAR_EXCEPTION(env);
+    JNI_CLR();
     goto jni_done;
   }
 
@@ -203,12 +321,13 @@ int get_files_dir_jni(char *out_buf, size_t out_sz) {
    * POLLING LOOP: Wait for an Application with the payload marker.
    *
    * For each iteration:
-   *   1. Call currentApplication() to get the current app.
-   *   2. Extract its files dir path.
-   *   3. Check for payload marker (GADGET_SUBDIR).
-   *   4. If found: accept and return.
-   *   5. If not found but new app: create global ref to track it for next iteration.
-   *   6. If not found and SAME app: exit early (no progress).
+   *   1. Resolve an Application object via multiple framework paths.
+   *   2. Extract its files directory path.
+   *   3. Check for the payload marker (GADGET_SUBDIR).
+   *   4. If found, accept and return the path.
+   *   5. If not found, continue polling (never accept without payload).
+   *
+   * This ensures a proxy application is never mistaken for the target.
    */
   for (int i = 0; i < 30; ++i) {
     if (app) {
@@ -216,15 +335,15 @@ int get_files_dir_jni(char *out_buf, size_t out_sz) {
       app = NULL;
     }
 
-    /* Call currentApplication(). */
-    app = (*env)->CallStaticObjectMethod(env, cls_at, mid_ca);
-    JNI_CLEAR_EXCEPTION(env);
+    /* Resolve application using multiple framework entry points. */
+    app = resolve_application_jni(env, cls_at);
 
     if (app) {
+      resolved_any_app = true;
       char candidate_path[PATH_MAX] = {0};
 
       /* Try to extract this application's files directory. */
-      if (extract_files_dir_from_app(env, app, candidate_path, 
+      if (extract_files_dir_from_app(env, app, candidate_path,
                                       sizeof(candidate_path))) {
         /* Check if this application has the payload marker. */
         if (is_target_app_ready(candidate_path)) {
@@ -236,35 +355,14 @@ int get_files_dir_jni(char *out_buf, size_t out_sz) {
           break;
         }
 
-        /* No payload in this candidate. Check if it's the same app again. */
-        int is_same_as_last = (g_last_app_seen && 
-                               (*env)->IsSameObject(env, app, g_last_app_seen));
-
-        if (is_same_as_last) {
-          /*
-           * EARLY EXIT: Same application, still no payload.
-           * This means no new applications have loaded since the last poll.
-           * Waiting longer won't help. Accept this path and return;
-           * the natural abort check (missing gadget file) will trigger.
-           */
-          LOGD("get_files_dir_jni: same application seen twice without payload, exiting early");
-          strncpy(out_buf, candidate_path, out_sz - 1);
-          out_buf[out_sz - 1] = '\0';
-          result = 1;
-          break;
-        }
-
-        /* Different application, no payload yet. Keep waiting for target. */
-        LOGD("get_files_dir_jni: candidate '%s' lacks payload, continuing poll", 
+        /* Candidate lacks payload; keep polling. Do NOT accept. */
+        LOGD("get_files_dir_jni: candidate '%s' lacks payload, waiting for target",
              candidate_path);
-
-        /* Remember this application for next iteration's comparison. */
-        if (g_last_app_seen)
-          (*env)->DeleteGlobalRef(env, g_last_app_seen);
-        g_last_app_seen = (*env)->NewGlobalRef(env, app);
       }
 
       app = NULL; /* Clear local ref, will re-fetch next iteration. */
+    } else {
+      LOGD("get_files_dir_jni: application not resolved yet, retrying...");
     }
 
     /* Log progress at intervals. */
@@ -274,9 +372,12 @@ int get_files_dir_jni(char *out_buf, size_t out_sz) {
     sleep(1);
   }
 
-  /* If polling completed without finding target. */
-  if (!result && !app) {
-    LOGW("get_files_dir_jni: no application with payload found after 30 seconds");
+  /* Timeout reached without finding target. */
+  if (!result) {
+    if (resolved_any_app)
+      LOGW("get_files_dir_jni: application resolved, but no payload marker found within timeout");
+    else
+      LOGW("get_files_dir_jni: no application resolved within timeout");
     goto jni_done;
   }
 
@@ -284,12 +385,11 @@ jni_done:
   /* Clean up all JNI references. */
   if (app)
     (*env)->DeleteLocalRef(env, app);
-  if (g_last_app_seen)
-    (*env)->DeleteGlobalRef(env, g_last_app_seen);
   if (cls_at)
     (*env)->DeleteLocalRef(env, cls_at);
   if (attached)
     (*jvm)->DetachCurrentThread(jvm);
 
   return result;
+  #undef JNI_CLR
 }
