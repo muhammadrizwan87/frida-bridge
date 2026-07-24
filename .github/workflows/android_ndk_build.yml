@@ -28,5 +28,5 @@ jobs:
         
     - uses: actions/upload-artifact@v6
       with:
-        name: FridaBridge-v2.1.0
+        name: FridaBridge-v2.2.0
         path: artifacts/
